@@ -48,6 +48,11 @@ Thumbs.db
 # AWS / Lambda
 *.zip
 .aws/
+backend/package/
+
+# Dataset (large file, not for version control)
+Dataset.csv
+*.csv
 
 # Logs
 *.log

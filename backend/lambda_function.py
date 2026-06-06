@@ -155,58 +155,143 @@ def handle_chat(event: dict) -> dict:
     POST /chat
     Body: {"messages": [...{role, content}...]}
 
-    Drives AI intake conversation. When all 3 fields are collected,
-    creates a request and kicks off level-1 escalation.
+    Agentic intake: searches bridges first (GREEN→YELLOW→RED), falls back to
+    donor pool. If outside local area, expands to nearest cities.
+    Self-optimisation: donor stats update on every YES/NO.
     """
-    body = _parse_body(event)
+    body     = _parse_body(event)
     messages = body.get("messages", [])
 
     if not messages:
         return bad_request("messages array is required")
 
-    logger.info(f"Chat with {len(messages)} message(s)")
+    logger.info(f"Agent chat with {len(messages)} message(s)")
 
+    # Extract user_id or phone from messages for DB lookup
+    known_profile = None
+    prior_blood_group = None
+    prior_city = None
+    import re
+    for msg in messages:
+        if msg.get("role") == "user":
+            txt = msg.get("content", "").strip()
+            if known_profile:
+                break
+            # User ID: looks like a long hex string (40+ chars) or starts with common prefixes
+            uid_match = re.search(r'\b([a-f0-9]{32,})\b', txt.lower())
+            if uid_match:
+                try:
+                    candidate = db_helpers.donors_table.get_item(
+                        Key={"donor_id": uid_match.group(1)}
+                    ).get("Item")
+                    if candidate:
+                        known_profile = candidate
+                        prior_blood_group = known_profile.get("blood_group")
+                        prior_city = known_profile.get("city", "")
+                        logger.info(f"User ID lookup matched donor_id={uid_match.group(1)}")
+                except Exception as exc:
+                    logger.warning(f"User ID lookup failed (non-fatal): {exc}")
+            # Phone detection fallback
+            if not known_profile:
+                phone_match = re.search(r'(\+?91[\s-]?)?[6-9]\d{9}', txt.replace(" ", ""))
+                if phone_match:
+                    try:
+                        known_profile = db_helpers.lookup_donor_by_phone(phone_match.group())
+                        if known_profile:
+                            prior_blood_group = known_profile.get("blood_group")
+                            prior_city = known_profile.get("city", "")
+                            logger.info(f"Phone lookup matched profile")
+                    except Exception as exc:
+                        logger.warning(f"Phone lookup failed (non-fatal): {exc}")
+            # Blood group detection from text
+            for bg, variants in [
+                ("O Positive", ["o positive", "o+"]),
+                ("O Negative", ["o negative", "o-"]),
+                ("A Positive", ["a positive", "a+"]),
+                ("A Negative", ["a negative", "a-"]),
+                ("B Positive", ["b positive", "b+"]),
+                ("B Negative", ["b negative", "b-"]),
+                ("AB Positive", ["ab positive", "ab+"]),
+                ("AB Negative", ["ab negative", "ab-"]),
+            ]:
+                if any(v in txt.lower() for v in variants):
+                    prior_blood_group = bg
+                    break
+
+    # Fetch live bridge/donor availability if blood group is known
+    bridge_context = None
+    if prior_blood_group:
+        try:
+            bridges      = db_helpers.get_bridges_for_patient(prior_blood_group, prior_city)
+            local_donors = db_helpers.get_eligible_donors(city=prior_city) if prior_city else db_helpers.get_eligible_donors()
+            ranked       = matching.rank_donors(local_donors, prior_blood_group, exact_only=False)
+            bridge_context = {
+                "green_count":  sum(1 for b in bridges if b.get("health_status") == "GREEN"),
+                "yellow_count": sum(1 for b in bridges if b.get("health_status") == "YELLOW"),
+                "red_count":    sum(1 for b in bridges if b.get("health_status") == "RED"),
+                "donor_count":  len(ranked),
+            }
+            logger.info(f"Bridge context for {prior_blood_group}: {bridge_context}")
+        except Exception as exc:
+            logger.warning(f"Bridge context fetch failed (non-fatal): {exc}")
+
+    # Single Bedrock call with full context
     try:
-        ai_result    = bedrock_helpers.chat_with_patient(messages)
+        ai_result     = bedrock_helpers.chat_with_patient(messages, bridge_context=bridge_context, known_profile=known_profile)
         response_text = ai_result.get("response_text", "")
-        extracted    = ai_result.get("extracted_data", {}) or {}
+        extracted     = ai_result.get("extracted_data", {}) or {}
+        ready         = ai_result.get("ready", False)
     except Exception as exc:
-        logger.error(f"Bedrock chat error: {exc}", exc_info=True)
+        logger.error(f"Bedrock agent error: {exc}", exc_info=True)
         return server_error("AI service unavailable")
 
-    request_id = None
     blood_group   = extracted.get("blood_group")
+    city          = extracted.get("city")
     hospital_name = extracted.get("hospital_name")
     urgency       = extracted.get("urgency")
 
-    if blood_group and hospital_name and urgency:
-        logger.info("All fields collected — creating request")
+    request_id = None
+    if ready and blood_group and hospital_name and urgency:
+        logger.info("Agent ready — creating request and escalating")
         try:
             request_id = f"BWR-{int(time.time())}"
+            now = datetime.now(timezone.utc).isoformat()
             request_data = {
                 "request_id":          request_id,
                 "blood_group":         blood_group,
                 "hospital_name":       hospital_name,
+                "city":                city or "",
                 "urgency":             urgency,
                 "status":              "PENDING",
                 "escalation_level":    1,
                 "ranked_donor_ids":    [],
                 "contacted_donor_ids": [],
                 "confirmed_donor_id":  None,
-                "created_at":          datetime.now(timezone.utc).isoformat(),
-                "updated_at":          datetime.now(timezone.utc).isoformat(),
+                "created_at":          now,
+                "updated_at":          now,
                 "outreach_message":    "",
             }
             db_helpers.create_request(request_data)
 
-            eligible = db_helpers.get_eligible_donors()
-            ranked   = matching.rank_donors(eligible, blood_group, exact_only=True)
-            top10_ids = [d["donor_id"] for d in ranked[:10]]
+            # Prioritise with full tier system — pass coordinates if known_profile has them
+            ref_lat = float(known_profile.get("latitude") or 0) or None if known_profile else None
+            ref_lon = float(known_profile.get("longitude") or 0) or None if known_profile else None
+            all_eligible = db_helpers.get_eligible_donors(city=city) or db_helpers.get_eligible_donors()
+            ranked = matching.prioritise_donors(
+                all_eligible, blood_group,
+                declined_donor_ids=[],
+                ref_lat=ref_lat, ref_lon=ref_lon,
+            )
+            top10_ids = [d["donor_id"] for d in ranked[:10] if d.get("donor_id")]
             db_helpers.update_request(request_id, {"ranked_donor_ids": top10_ids})
-            request_data["ranked_donor_ids"] = top10_ids
+            request_data["ranked_donor_ids"]  = top10_ids
+            request_data["declined_donor_ids"] = []
+            if ref_lat:
+                request_data["latitude"]  = str(ref_lat)
+                request_data["longitude"] = str(ref_lon)
 
-            escalation_module.run_escalation(request_data, eligible)
-            logger.info(f"Request {request_id} created and level-1 escalation triggered")
+            escalation_module.run_escalation(request_data, all_eligible)
+            logger.info(f"Request {request_id} created, level-1 escalation triggered")
         except Exception as exc:
             logger.error(f"Failed to create/escalate request: {exc}", exc_info=True)
             request_id = None
@@ -215,6 +300,7 @@ def handle_chat(event: dict) -> dict:
         "response_text": response_text,
         "extracted_data": extracted,
         "request_id":     request_id,
+        "bridge_context": bridge_context,
     })
 
 
@@ -301,6 +387,12 @@ def handle_confirm(event: dict) -> dict:
     logger.info(f"Donor {donor_id} responded '{action}' for request {request_id}")
 
     try:
+        # Self-optimisation: update donor stats on every response
+        try:
+            db_helpers.record_donor_response(donor_id, donated=(action == "yes"))
+        except Exception as exc:
+            logger.warning(f"record_donor_response non-fatal error: {exc}")
+
         if action == "yes":
             db_helpers.update_request(request_id, {
                 "confirmed_donor_id": donor_id,
@@ -316,6 +408,10 @@ def handle_confirm(event: dict) -> dict:
                 "confirmed":    True,
             })
         else:
+            # Track declined donors so re-ping logic can skip them
+            req = db_helpers.get_request(request_id) or {}
+            declined = list(set(req.get("declined_donor_ids", []) + [donor_id]))
+            db_helpers.update_request(request_id, {"declined_donor_ids": declined})
             return response(200, {
                 "message":    "Thank you for letting us know. We will contact another donor.",
                 "confirmed":  False,

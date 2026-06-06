@@ -38,30 +38,38 @@ logger = _get_logger(__name__)
 # DynamoDB resource
 # ---------------------------------------------------------------------------
 
-REGION = os.environ.get("AWS_REGION", "eu-north-1")
-DONORS_TABLE   = os.environ.get("DONORS_TABLE",   "donors")
-REQUESTS_TABLE = os.environ.get("REQUESTS_TABLE", "requests")
-BRIDGES_TABLE  = os.environ.get("BRIDGES_TABLE",  "bridges")
+REGION          = os.environ.get("AWS_REGION", "eu-north-1")
+DONORS_TABLE    = os.environ.get("DONORS_TABLE",    "donors")
+REQUESTS_TABLE  = os.environ.get("REQUESTS_TABLE",  "requests")
+BRIDGES_TABLE   = os.environ.get("BRIDGES_TABLE",   "bridges")
+LOCATIONS_TABLE = os.environ.get("LOCATIONS_TABLE", "locations")
 
-dynamodb = boto3.resource("dynamodb", region_name=REGION)
-donors_table   = dynamodb.Table(DONORS_TABLE)
-requests_table = dynamodb.Table(REQUESTS_TABLE)
-bridges_table  = dynamodb.Table(BRIDGES_TABLE)
+dynamodb        = boto3.resource("dynamodb", region_name=REGION)
+donors_table    = dynamodb.Table(DONORS_TABLE)
+requests_table  = dynamodb.Table(REQUESTS_TABLE)
+bridges_table   = dynamodb.Table(BRIDGES_TABLE)
+locations_table = dynamodb.Table(LOCATIONS_TABLE)
+
+# In-memory cache so repeated Lambda calls don't re-read DynamoDB
+_location_cache: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Donors
 # ---------------------------------------------------------------------------
 
-def get_eligible_donors() -> list:
-    """Paginated scan for donors that are eligible and actively donating."""
-    logger.info("Scanning for eligible donors")
+def get_eligible_donors(city: str = None) -> list:
+    """Paginated scan for donors that are eligible and actively donating.
+    Optionally filter by city for location-aware matching.
+    """
+    logger.info(f"Scanning for eligible donors" + (f" in city={city}" if city else ""))
     results = []
-    scan_kwargs = {
-        "FilterExpression": (
-            Attr("eligibility_status").eq("eligible")
-            & Attr("user_donation_active_status").eq("Active")
-        )
-    }
+    filter_expr = (
+        Attr("eligibility_status").eq("eligible")
+        & Attr("user_donation_active_status").eq("Active")
+    )
+    if city:
+        filter_expr = filter_expr & Attr("city").eq(city)
+    scan_kwargs = {"FilterExpression": filter_expr}
     try:
         while True:
             resp = donors_table.scan(**scan_kwargs)
@@ -74,6 +82,92 @@ def get_eligible_donors() -> list:
     except ClientError as exc:
         logger.error(f"get_eligible_donors failed: {exc.response['Error']['Message']}")
         raise
+
+
+def get_bridges_for_patient(blood_group: str, city: str = None) -> list:
+    """Scan bridges matching blood group, optionally filtered by city.
+    Returns sorted GREEN → YELLOW → RED so callers always see best first.
+    """
+    from bridge_health import classify_bridge  # avoid circular import at module level
+    logger.info(f"Searching bridges for blood_group={blood_group} city={city}")
+    results = []
+    filter_expr = Attr("blood_group").eq(blood_group)
+    if city:
+        filter_expr = filter_expr & Attr("hospital_name").contains(city)
+    scan_kwargs = {"FilterExpression": filter_expr}
+    try:
+        while True:
+            resp = bridges_table.scan(**scan_kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    except ClientError as exc:
+        logger.error(f"get_bridges_for_patient failed: {exc.response['Error']['Message']}")
+        raise
+
+    order = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    for b in results:
+        b["health_status"] = classify_bridge(b)
+    results.sort(key=lambda b: order.get(b["health_status"], 3))
+    logger.info(f"Found {len(results)} matching bridges")
+    return results
+
+
+def record_donor_response(donor_id: str, donated: bool) -> dict:
+    """Update donor stats after a YES/NO response — self-optimisation loop."""
+    logger.info(f"Recording donor response donor_id={donor_id} donated={donated}")
+    try:
+        item = donors_table.get_item(Key={"donor_id": donor_id}).get("Item", {})
+        total_calls = int(item.get("total_calls") or item.get("donations_till_date") or 0) + 1
+        donations   = int(item.get("donations_till_date", 0) or 0)
+        if donated:
+            donations += 1
+        ratio = round(total_calls / donations, 2) if donations > 0 else float(total_calls)
+        updates = {
+            "total_calls":              str(total_calls),
+            "calls_to_donations_ratio": str(ratio),
+            "last_contacted_date":      datetime.now(timezone.utc).date().isoformat(),
+        }
+        if donated:
+            updates["donations_till_date"] = str(donations)
+            updates["last_donation_date"]  = datetime.now(timezone.utc).date().isoformat()
+        result = _dynamic_update(donors_table, {"donor_id": donor_id}, updates)
+        logger.info(f"Donor {donor_id} stats updated: calls={total_calls} donations={donations} ratio={ratio}")
+        return result
+    except ClientError as exc:
+        logger.error(f"record_donor_response failed for {donor_id}: {exc.response['Error']['Message']}")
+        raise
+
+
+def lookup_donor_by_phone(phone: str) -> dict | None:
+    """Scan donors table for a matching phone number. Returns first match or None."""
+    logger.info(f"Looking up donor by phone (last 4 digits: ...{phone[-4:]})")
+    # Normalise: strip spaces, dashes, leading +91 / 0
+    cleaned = phone.strip().replace(" ", "").replace("-", "")
+    if cleaned.startswith("+91"):
+        cleaned = cleaned[3:]
+    elif cleaned.startswith("91") and len(cleaned) == 12:
+        cleaned = cleaned[2:]
+    cleaned = cleaned.lstrip("0")
+
+    results = []
+    try:
+        for field in ("phone_number", "phone", "mobile", "contact_number"):
+            resp = donors_table.scan(
+                FilterExpression=Attr(field).contains(cleaned),
+                Limit=5,
+            )
+            results.extend(resp.get("Items", []))
+            if results:
+                break
+    except ClientError as exc:
+        logger.warning(f"lookup_donor_by_phone scan error: {exc.response['Error']['Message']}")
+    if results:
+        logger.info(f"Phone lookup found donor_id={results[0].get('donor_id')}")
+        return results[0]
+    logger.info("Phone lookup: no match found")
+    return None
 
 
 def get_donors_by_ids(ids: list) -> list:
@@ -174,6 +268,25 @@ def get_all_bridges() -> list:
     except ClientError as exc:
         logger.error(f"get_all_bridges failed: {exc.response['Error']['Message']}")
         raise
+
+
+def get_location_name(latitude: str, longitude: str) -> str:
+    """
+    Look up pre-geocoded area name from the locations table.
+    Falls back to 'Hyderabad Area' if not found.
+    Caches results in Lambda memory for the lifetime of the execution environment.
+    """
+    key = f"{latitude}_{longitude}"
+    if key in _location_cache:
+        return _location_cache[key]
+    try:
+        resp = locations_table.get_item(Key={"coord_key": key})
+        name = resp.get("Item", {}).get("location_name", "Hyderabad Area")
+    except ClientError as exc:
+        logger.warning(f"get_location_name failed for {key}: {exc.response['Error']['Message']}")
+        name = "Hyderabad Area"
+    _location_cache[key] = name
+    return name
 
 
 def update_bridge(bridge_id: str, updates: dict) -> dict:

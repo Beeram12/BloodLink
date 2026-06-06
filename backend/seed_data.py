@@ -78,12 +78,26 @@ def load_csv_donors(csv_path: str) -> dict:
             reader = csv.DictReader(f)
             with donors_table.batch_writer() as batch:
                 for row in reader:
-                    # Strip whitespace from all fields; skip rows with no donor_id
-                    clean = {k.strip(): (v.strip() if v else "") for k, v in row.items()}
+                    # Strip whitespace; remove \x27/\x96 escape prefixes from hex-escaped values
+                    clean = {}
+                    for k, v in row.items():
+                        key = k.strip()
+                        val = (v.strip() if v else "")
+                        # Remove leading backslash-hex escape artifacts (e.g. \x27...)
+                        if val.startswith("\\x") and len(val) > 4:
+                            val = val[4:]
+                        clean[key] = val
+
+                    # Dataset uses user_id — map to donor_id for our schema
                     if not clean.get("donor_id"):
-                        logger.warning(f"Row missing donor_id — skipping: {clean}")
-                        errors += 1
-                        continue
+                        uid = clean.get("user_id", "")
+                        if uid:
+                            clean["donor_id"] = uid
+                        else:
+                            logger.warning(f"Row missing user_id/donor_id — skipping")
+                            errors += 1
+                            continue
+
                     try:
                         batch.put_item(Item=clean)
                         loaded += 1

@@ -3,7 +3,7 @@ import { API } from '../App';
 
 const INITIAL_MESSAGE = {
   role:    'assistant',
-  content: "Hi, I'm BloodLink. I can help you find a blood donor. What blood group does the patient need?",
+  content: "Hi, I'm BloodLink. I can help you find a blood donor. Could you share the patient's User ID or blood group to get started?",
 };
 
 // ── Chat bubble ──────────────────────────────────────────────────────────────
@@ -138,15 +138,28 @@ export default function PatientHome() {
   const [requestId, setRequestId] = useState(null);
   const [visible,   setVisible]   = useState(false);
   const [showChips, setShowChips] = useState(true);
-  const bottomRef = useRef(null);
-  const inputRef  = useRef(null);
+  const bottomRef  = useRef(null);
+  const inputRef   = useRef(null);
+  const chatBoxRef = useRef(null);
 
   useEffect(() => { setVisible(true); }, []);
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, loading]);
+  useEffect(() => {
+    if (chatBoxRef.current) {
+      chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+    }
+  }, [messages, loading]);
+
+  const reset = () => {
+    setMessages([INITIAL_MESSAGE]);
+    setInput('');
+    setRequestId(null);
+    setShowChips(true);
+    setLoading(false);
+  };
 
   const send = async (overrideText) => {
     const text = (overrideText ?? input).trim();
-    if (!text || loading || requestId) return;
+    if (!text || loading) return;
     setShowChips(false);
     const userMsg    = { role: 'user', content: text };
     const newHistory = [...messages, userMsg];
@@ -238,10 +251,9 @@ export default function PatientHome() {
           </div>
 
           {/* Messages — tall, readable */}
-          <div className="h-80 lg:h-96 overflow-y-auto px-5 pt-5 pb-2">
+          <div ref={chatBoxRef} className="h-80 lg:h-96 overflow-y-auto px-5 pt-5 pb-2">
             {messages.map((m, i) => <Bubble key={i} role={m.role} content={m.content} />)}
             {loading && <TypingDots />}
-            <div ref={bottomRef} />
           </div>
 
           {/* Blood group chips — shown on first message only */}
@@ -252,7 +264,7 @@ export default function PatientHome() {
             </div>
           )}
 
-          {/* Input bar — large for accessibility */}
+          {/* Input bar */}
           <div className="border-t border-border flex items-center gap-0">
             <input
               ref={inputRef}
@@ -260,26 +272,35 @@ export default function PatientHome() {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), send())}
-              disabled={loading || !!requestId}
-              placeholder={requestId ? 'Request submitted — donors are being contacted' : 'Type your message here...'}
+              disabled={loading}
+              placeholder={requestId ? 'Ask a follow-up question...' : 'Type your message here...'}
               className="flex-1 bg-transparent text-foreground text-base px-5 py-4 placeholder-muted-fg focus:outline-none disabled:opacity-40"
             />
             <button
               onClick={() => send()}
-              disabled={loading || !input.trim() || !!requestId}
+              disabled={loading || !input.trim()}
               className="bg-blood text-white text-sm font-semibold px-6 py-4 hover:bg-blood/90 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
             >
               Send
             </button>
+            {requestId && (
+              <button
+                onClick={reset}
+                className="text-muted-fg text-sm font-mono px-4 py-4 hover:text-foreground transition-colors border-l border-border"
+                title="Start a new request"
+              >
+                End
+              </button>
+            )}
           </div>
         </div>
 
         {/* Help tip */}
-        {!requestId && (
-          <p className="text-center text-xs text-muted-fg font-mono mt-3">
-            Tell us the blood group · hospital name · urgency level
-          </p>
-        )}
+        <p className="text-center text-xs text-muted-fg font-mono mt-3">
+          {requestId
+            ? 'Donors are being contacted · Click End to start a new request'
+            : 'Tell us the blood group · hospital name · urgency level'}
+        </p>
       </div>
 
       {/* ── Stats marquee ───────────────────────────────────────────── */}
