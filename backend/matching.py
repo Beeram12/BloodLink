@@ -279,6 +279,95 @@ def rank_donors(
     return result
 
 
+def classify_donor(donor: dict, patient_transfusion_date: str = None) -> str:
+    """
+    Classify a single donor as GREEN, YELLOW, or RED based on dataset fields.
+    Uses patient's expected_next_transfusion_date for gap_days calculation.
+
+    GREEN  — Active AND gap_days >= 0 AND calls_to_donations_ratio <= 5
+    YELLOW — Active BUT gap_days < 0 OR ratio > 5
+    RED    — Inactive regardless of anything else
+    """
+    is_active = (donor.get("user_donation_active_status") or "").strip() == "Active"
+    if not is_active:
+        return "RED"
+
+    # Use patient transfusion date if provided, else fall back to donor's own field
+    transfusion_str = patient_transfusion_date or donor.get("expected_next_transfusion_date", "")
+    next_eligible_str = donor.get("next_eligible_date", "")
+
+    gap_days = 0
+    if transfusion_str and next_eligible_str:
+        t_date = _parse_date(transfusion_str)
+        e_date = _parse_date(next_eligible_str)
+        if t_date and e_date:
+            gap_days = (t_date - e_date).days
+
+    ratio = _safe_float(donor.get("calls_to_donations_ratio", ""))
+
+    if gap_days >= 0 and ratio <= 5:
+        return "GREEN"
+    return "YELLOW"
+
+
+def build_donor_entry(donor: dict, classification: str, patient_lat: float = None,
+                      patient_lon: float = None, patient_transfusion_date: str = None) -> dict:
+    """Build a clean donor dict for API responses — no raw coords, includes location_name."""
+    import db_helpers
+    lat = donor.get("latitude", "")
+    lon = donor.get("longitude", "")
+    location_name = db_helpers.get_location_name(lat, lon) if lat and lon else "Hyderabad Area"
+
+    dist_km = None
+    if patient_lat and patient_lon:
+        dist_km = round(_distance_km(donor, patient_lat, patient_lon), 2)
+
+    # gap_days relative to patient transfusion date
+    gap_days = None
+    if patient_transfusion_date:
+        t_date = _parse_date(patient_transfusion_date)
+        e_date = _parse_date(donor.get("next_eligible_date", "") or "")
+        if t_date and e_date:
+            gap_days = (t_date - e_date).days
+
+    return {
+        "user_id":                     donor.get("user_id") or donor.get("donor_id", ""),
+        "donor_id":                    donor.get("donor_id") or donor.get("user_id", ""),
+        "blood_group":                 donor.get("blood_group", ""),
+        "gender":                      donor.get("gender", ""),
+        "active":                      (donor.get("user_donation_active_status") or "").strip() == "Active",
+        "eligibility_status":          donor.get("eligibility_status", ""),
+        "calls_to_donations_ratio":    donor.get("calls_to_donations_ratio", ""),
+        "donations_till_date":         donor.get("donations_till_date", ""),
+        "next_eligible_date":          donor.get("next_eligible_date", ""),
+        "location_name":               location_name,
+        "classification":              classification,
+        "gap_days":                    gap_days,
+        "distance_km":                 dist_km,
+        "role":                        donor.get("role", ""),
+    }
+
+
+def get_emergency_donors_near(all_donors: list, blood_group: str,
+                               patient_lat: float, patient_lon: float,
+                               limit: int = 5) -> list:
+    """
+    Return top N emergency donors sorted by distance from patient.
+    Filters: role=Emergency Donor, eligibility_status=eligible, Active, compatible blood group.
+    """
+    compatible = get_compatible_blood_groups(blood_group)
+    candidates = [
+        d for d in all_donors
+        if (d.get("role") or "").strip() == "Emergency Donor"
+        and d.get("eligibility_status", "") == "eligible"
+        and (d.get("user_donation_active_status") or "").strip() == "Active"
+        and d.get("blood_group", "") in compatible
+    ]
+    # Sort by distance
+    candidates.sort(key=lambda d: _distance_km(d, patient_lat, patient_lon))
+    return candidates[:limit]
+
+
 def score_donor(donor: dict, required_blood_group: str) -> int:
     """
     Legacy single-donor score (0-100) kept for bridge_health replacement_candidates.

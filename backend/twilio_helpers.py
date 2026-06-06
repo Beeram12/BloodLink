@@ -39,6 +39,8 @@ TWILIO_AUTH_TOKEN     = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_WHATSAPP  = os.environ.get("TWILIO_FROM_WHATSAPP", "whatsapp:+14155238886")
 TWILIO_FROM_SMS       = os.environ.get("TWILIO_FROM_SMS", "")
 API_BASE_URL          = os.environ.get("API_BASE_URL", "").rstrip("/")
+# Frontend URL for donor-facing pages (confirm link opens the React page, not raw API)
+FRONTEND_URL          = os.environ.get("FRONTEND_URL", API_BASE_URL).rstrip("/")
 
 _twilio_client = None
 
@@ -128,7 +130,8 @@ def send_donor_outreach(donor: dict, request_id: str, message: str) -> dict:
         logger.warning(f"No phone number for donor {donor_id} ({donor_name}) — skipping outreach")
         return {"success": False, "error": "No phone number", "channel": "none", "donor_id": donor_id}
 
-    confirm_url = f"{API_BASE_URL}/confirm?request_id={request_id}&donor_id={donor_id}&action=yes"
+    # Links open the React frontend page (/donor-confirm), not the raw API
+    confirm_url = f"{FRONTEND_URL}/confirm?request_id={request_id}&donor_id={donor_id}"
     decline_url = f"{API_BASE_URL}/confirm?request_id={request_id}&donor_id={donor_id}&action=no"
     full_message = (
         f"{message}\n\n"

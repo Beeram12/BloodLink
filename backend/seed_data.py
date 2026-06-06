@@ -9,6 +9,7 @@ Usage (run locally with valid AWS credentials):
 import csv
 import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -63,39 +64,52 @@ bridges_table  = dynamodb.Table(BRIDGES_TABLE)
 # CSV loader
 # ---------------------------------------------------------------------------
 
-def load_csv_donors(csv_path: str) -> dict:
+def _strip_hex_prefix(val: str) -> str:
+    """Remove all leading \\xNN escape sequences (literal backslash-x-hex pairs from CSV)."""
+    return re.sub(r'^(\\x[0-9a-fA-F]{2})+', '', val).strip()
+
+
+def load_csv_donors(csv_path: str, overwrite: bool = False) -> dict:
     """
     Read a donor CSV and bulk-insert into DynamoDB.
     All field values are stored as strings (as they arrive from the CSV).
-    Returns {"loaded": N, "errors": M}.
+    If overwrite=False, skips records whose donor_id already exists in DynamoDB.
+    Returns {"loaded": N, "skipped": S, "errors": M}.
     """
-    loaded = 0
-    errors = 0
-    logger.info(f"Loading donors from CSV: {csv_path}")
+    loaded  = 0
+    skipped = 0
+    errors  = 0
+    logger.info(f"Loading donors from CSV: {csv_path} overwrite={overwrite}")
 
     try:
         with open(csv_path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             with donors_table.batch_writer() as batch:
                 for row in reader:
-                    # Strip whitespace; remove \x27/\x96 escape prefixes from hex-escaped values
                     clean = {}
                     for k, v in row.items():
-                        key = k.strip()
-                        val = (v.strip() if v else "")
-                        # Remove leading backslash-hex escape artifacts (e.g. \x27...)
-                        if val.startswith("\\x") and len(val) > 4:
-                            val = val[4:]
+                        key = k.strip() if k else k
+                        val = v.strip() if v else ""
                         clean[key] = val
 
-                    # Dataset uses user_id — map to donor_id for our schema
+                    # Store user_id RAW (including \xNN prefix) as donor_id
+                    # so volunteers can paste directly from CSV without any stripping
                     if not clean.get("donor_id"):
                         uid = clean.get("user_id", "")
                         if uid:
                             clean["donor_id"] = uid
                         else:
-                            logger.warning(f"Row missing user_id/donor_id — skipping")
+                            logger.warning("Row missing user_id/donor_id — skipping")
                             errors += 1
+                            continue
+
+                    # Skip if already exists (unless overwrite requested)
+                    if not overwrite:
+                        existing = donors_table.get_item(
+                            Key={"donor_id": clean["donor_id"]}
+                        ).get("Item")
+                        if existing:
+                            skipped += 1
                             continue
 
                     try:
@@ -106,15 +120,16 @@ def load_csv_donors(csv_path: str) -> dict:
                     except ClientError as exc:
                         logger.error(f"Failed to write donor {clean.get('donor_id')}: {exc.response['Error']['Message']}")
                         errors += 1
+
     except FileNotFoundError:
         logger.error(f"CSV file not found: {csv_path}")
-        return {"loaded": 0, "errors": 1}
+        return {"loaded": 0, "skipped": 0, "errors": 1}
     except Exception as exc:
         logger.error(f"CSV load failed: {exc}")
-        return {"loaded": loaded, "errors": errors + 1}
+        return {"loaded": loaded, "skipped": skipped, "errors": errors + 1}
 
-    logger.info(f"CSV load complete — loaded: {loaded}, errors: {errors}")
-    return {"loaded": loaded, "errors": errors}
+    logger.info(f"CSV load complete — loaded: {loaded}, skipped: {skipped}, errors: {errors}")
+    return {"loaded": loaded, "skipped": skipped, "errors": errors}
 
 # ---------------------------------------------------------------------------
 # Demo data seeder
@@ -237,9 +252,10 @@ if __name__ == "__main__":
 
     elif command == "load-csv":
         if len(sys.argv) < 3:
-            print("Usage: python seed_data.py load-csv <csv_path>")
+            print("Usage: python seed_data.py load-csv <csv_path> [--overwrite]")
             sys.exit(1)
-        result = load_csv_donors(sys.argv[2])
+        overwrite = "--overwrite" in sys.argv
+        result = load_csv_donors(sys.argv[2], overwrite=overwrite)
         print(json.dumps(result, indent=2))
 
     else:
