@@ -224,6 +224,36 @@ export default function DonorConfirm() {
   const urgencyKey = (req?.urgency || '').toLowerCase();
   const urgency    = URGENCY_MAP[urgencyKey] || URGENCY_MAP.standard;
 
+  // ── Expired: donor already declined this request ───────────────────────────
+  const declinedIds = req?.declined_donor_ids || [];
+  const alreadyDeclined = declinedIds.includes(donor_id);
+  // Also expired if someone else already confirmed (DONOR_FOUND or beyond)
+  const alreadyConfirmedByOther = req?.confirmed_donor_id && req.confirmed_donor_id !== donor_id
+    && ['DONOR_FOUND','ARRIVING','TRANSFUSING','COMPLETED'].includes(req?.status);
+
+  if ((alreadyDeclined || alreadyConfirmedByOther) && !action) {
+    return (
+      <div className="min-h-screen flex items-center justify-center noise-overlay px-6">
+        <div className="fixed inset-0 grid-lines pointer-events-none opacity-20" />
+        <div className={`relative z-10 max-w-sm w-full text-center transition-all duration-700 ${visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-6'}`}>
+          <div className="w-16 h-16 rounded-full bg-border/40 flex items-center justify-center mx-auto mb-6">
+            <svg className="w-7 h-7 text-muted-fg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+            </svg>
+          </div>
+          <h1 className="font-display text-4xl text-foreground leading-tight mb-3">
+            This link has expired.
+          </h1>
+          <p className="text-sm text-muted-fg leading-relaxed">
+            {alreadyDeclined
+              ? 'You have already responded to this request. Thank you for letting us know.'
+              : 'A donor has already confirmed for this request. Thank you for your willingness to help.'}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   // ── Questionnaire (after YES) ──────────────────────────────────────────────
 
   if (action === 'yes' && step >= 1 && step <= QUESTIONS.length && !submitted) {

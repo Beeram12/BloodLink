@@ -187,100 +187,169 @@ def handle_chat(event: dict) -> dict:
     """
     POST /chat
     Body: {"messages": [...{role, content}...]}
+
+    Flow:
+    1. Send messages to Bedrock
+    2. If response contains REQUEST_READY|user_id|urgency trigger:
+       - Look up patient in DynamoDB by user_id to get blood_group + location
+       - Create request record
+       - Run escalation (sends WhatsApp/SMS to donors)
     """
+    import re as _re
+
     body     = _parse_body(event)
     messages = body.get("messages", [])
 
     if not messages:
         return bad_request("messages array is required")
 
-    logger.info(f"Agent chat with {len(messages)} message(s)")
-
-    known_profile = None
-    prior_blood_group = None
-    prior_city = None
-    import re
-    for msg in messages:
-        if msg.get("role") == "user":
-            txt = msg.get("content", "").strip()
-            if known_profile:
-                break
-            uid_match = re.search(r'\b([a-f0-9]{32,})\b', txt.lower())
-            if uid_match:
-                try:
-                    candidate = db_helpers.donors_table.get_item(
-                        Key={"donor_id": uid_match.group(1)}
-                    ).get("Item")
-                    if candidate:
-                        known_profile = candidate
-                        prior_blood_group = known_profile.get("blood_group")
-                        prior_city = known_profile.get("city", "")
-                        logger.info(f"User ID lookup matched donor_id={uid_match.group(1)}")
-                except Exception as exc:
-                    logger.warning(f"User ID lookup failed (non-fatal): {exc}")
-            if not known_profile:
-                phone_match = re.search(r'(\+?91[\s-]?)?[6-9]\d{9}', txt.replace(" ", ""))
-                if phone_match:
-                    try:
-                        known_profile = db_helpers.lookup_donor_by_phone(phone_match.group())
-                        if known_profile:
-                            prior_blood_group = known_profile.get("blood_group")
-                            prior_city = known_profile.get("city", "")
-                    except Exception as exc:
-                        logger.warning(f"Phone lookup failed (non-fatal): {exc}")
-            for bg, variants in [
-                ("O Positive", ["o positive", "o+"]),
-                ("O Negative", ["o negative", "o-"]),
-                ("A Positive", ["a positive", "a+"]),
-                ("A Negative", ["a negative", "a-"]),
-                ("B Positive", ["b positive", "b+"]),
-                ("B Negative", ["b negative", "b-"]),
-                ("AB Positive", ["ab positive", "ab+"]),
-                ("AB Negative", ["ab negative", "ab-"]),
-            ]:
-                if any(v in txt.lower() for v in variants):
-                    prior_blood_group = bg
-                    break
-
-    bridge_context = None
-    if prior_blood_group:
-        try:
-            bridges      = db_helpers.get_bridges_for_patient(prior_blood_group, prior_city)
-            local_donors = db_helpers.get_eligible_donors(city=prior_city) if prior_city else db_helpers.get_eligible_donors()
-            ranked       = matching.rank_donors(local_donors, prior_blood_group, exact_only=False)
-            bridge_context = {
-                "green_count":  sum(1 for b in bridges if b.get("health_status") == "GREEN"),
-                "yellow_count": sum(1 for b in bridges if b.get("health_status") == "YELLOW"),
-                "red_count":    sum(1 for b in bridges if b.get("health_status") == "RED"),
-                "donor_count":  len(ranked),
-            }
-        except Exception as exc:
-            logger.warning(f"Bridge context fetch failed (non-fatal): {exc}")
+    logger.info(f"Chat with {len(messages)} message(s)")
 
     try:
-        ai_result     = bedrock_helpers.chat_with_patient(messages, bridge_context=bridge_context, known_profile=known_profile)
+        ai_result     = bedrock_helpers.chat_with_patient(messages)
         response_text = ai_result.get("response_text", "")
         extracted     = ai_result.get("extracted_data", {}) or {}
         ready         = ai_result.get("ready", False)
     except Exception as exc:
-        logger.error(f"Bedrock agent error: {exc}", exc_info=True)
-        return server_error("AI service unavailable")
-
-    blood_group   = extracted.get("blood_group")
-    city          = extracted.get("city")
-    hospital_name = extracted.get("hospital_name")
-    urgency       = extracted.get("urgency")
+        logger.error(f"Bedrock error: {exc}", exc_info=True)
+        return response(200, {
+            "response_text": "We are experiencing a brief technical issue. Please try again in a moment.",
+            "extracted_data": {},
+            "request_id": None,
+        })
 
     request_id = None
-    if ready and blood_group and hospital_name and urgency:
+
+    # Check for REQUEST_READY|user_id|urgency trigger in response text
+    trigger_match = _re.search(r'REQUEST_READY\|([^\|\n]+)\|([^\|\n]+)', response_text)
+
+    # Also fire when ready=True even if trigger pattern wasn't in response_text
+    # (bot may put the data in extracted_data instead of embedding the marker)
+    if ready and (trigger_match or extracted.get("urgency")):
+        if trigger_match:
+            raw_user_id = trigger_match.group(1).strip()
+            urgency     = trigger_match.group(2).strip().lower()
+        else:
+            raw_user_id = extracted.get("user_id") or "NO_USER_ID"
+            urgency     = (extracted.get("urgency") or "urgent").lower()
+
+        logger.info(f"REQUEST_READY triggered: user_id={raw_user_id[:20]} urgency={urgency}")
+
         try:
+            import uuid as _uuid
+
+            no_user_id = raw_user_id.upper() in ("NO_USER_ID", "UNREGISTERED", "NONE", "")
+            patient    = None
+
+            if not no_user_id:
+                # Look up patient by user_id to get blood_group and location
+                patient = db_helpers.donors_table.get_item(
+                    Key={"donor_id": raw_user_id}
+                ).get("Item")
+
+                if not patient:
+                    from boto3.dynamodb.conditions import Attr as _Attr
+                    scan = db_helpers.donors_table.scan(
+                        FilterExpression=_Attr("user_id").eq(raw_user_id) & _Attr("role").eq("Patient"),
+                        Limit=1,
+                    )
+                    items   = scan.get("Items", [])
+                    patient = items[0] if items else None
+
+            # City-to-coords lookup table for common Indian cities
+            CITY_COORDS = {
+                "hyderabad":  (17.3850, 78.4867), "secunderabad": (17.4399, 78.4983),
+                "delhi":      (28.6139, 77.2090), "new delhi":    (28.6139, 77.2090),
+                "mumbai":     (19.0760, 72.8777), "bangalore":    (12.9716, 77.5946),
+                "bengaluru":  (12.9716, 77.5946), "chennai":      (13.0827, 80.2707),
+                "kolkata":    (22.5726, 88.3639), "pune":         (18.5204, 73.8567),
+                "ahmedabad":  (23.0225, 72.5714), "jaipur":       (26.9124, 75.7873),
+                "surat":      (21.1702, 72.8311), "lucknow":      (26.8467, 80.9462),
+                "kanpur":     (26.4499, 80.3319), "nagpur":       (21.1458, 79.0882),
+                "visakhapatnam": (17.6868, 83.2185), "bhopal":    (23.2599, 77.4126),
+                "patna":      (25.5941, 85.1376), "vadodara":     (22.3072, 73.1812),
+            }
+
+            # Extract city from bot's extracted_data or scan conversation
+            chat_city = (extracted.get("city") or "").strip().lower()
+            if not chat_city:
+                conv_text = " ".join(m.get("content","") for m in messages if m.get("role")=="user").lower()
+                for city_key in CITY_COORDS:
+                    if city_key in conv_text:
+                        chat_city = city_key
+                        break
+
+            if patient:
+                blood_group = patient.get("blood_group", "O Positive")
+                p_lat_str   = patient.get("latitude", "")
+                p_lon_str   = patient.get("longitude", "")
+                db_lat      = float(p_lat_str) if p_lat_str else None
+                db_lon      = float(p_lon_str) if p_lon_str else None
+
+                # If patient gave a city, check if it matches DB location
+                if chat_city and chat_city in CITY_COORDS:
+                    chat_lat, chat_lon = CITY_COORDS[chat_city]
+                    # If DB location is missing or very far (>50km), update it
+                    location_mismatch = True
+                    if db_lat and db_lon:
+                        dist_km = math.sqrt((db_lat - chat_lat)**2 + (db_lon - chat_lon)**2) * 111
+                        location_mismatch = dist_km > 50
+                    if location_mismatch:
+                        logger.info(f"Updating patient {raw_user_id} location to {chat_city}")
+                        db_helpers.donors_table.update_item(
+                            Key={"donor_id": patient.get("donor_id", raw_user_id)},
+                            UpdateExpression="SET latitude=:lat, longitude=:lon, city=:city",
+                            ExpressionAttributeValues={":lat": str(chat_lat), ":lon": str(chat_lon), ":city": chat_city},
+                        )
+                        ref_lat, ref_lon = chat_lat, chat_lon
+                    else:
+                        ref_lat, ref_lon = db_lat, db_lon
+                else:
+                    ref_lat, ref_lon = db_lat, db_lon
+
+                location_name = chat_city.title() if chat_city else db_helpers.get_location_name(p_lat_str, p_lon_str) if p_lat_str else "Hyderabad"
+
+            else:
+                # No user ID or patient not found
+                blood_group = extracted.get("blood_group", "")
+                if not blood_group:
+                    bg_map = {
+                        "o positive": "O Positive", "o negative": "O Negative",
+                        "o+": "O Positive", "o-": "O Negative",
+                        "a positive": "A Positive", "a negative": "A Negative",
+                        "a+": "A Positive", "a-": "A Negative",
+                        "b positive": "B Positive", "b negative": "B Negative",
+                        "b+": "B Positive", "b-": "B Negative",
+                        "ab positive": "AB Positive", "ab negative": "AB Negative",
+                        "ab+": "AB Positive", "ab-": "AB Negative",
+                    }
+                    conv_text = " ".join(m.get("content","") for m in messages if m.get("role")=="user").lower()
+                    for key, val in bg_map.items():
+                        if key in conv_text:
+                            blood_group = val
+                            break
+                    if not blood_group:
+                        blood_group = "O Positive"
+
+                if chat_city and chat_city in CITY_COORDS:
+                    ref_lat, ref_lon = CITY_COORDS[chat_city]
+                    location_name = chat_city.title()
+                else:
+                    ref_lat, ref_lon = 17.3850, 78.4867
+                    location_name = "Hyderabad"
+
+                if no_user_id:
+                    raw_user_id = f"UNREG-{_uuid.uuid4().hex[:12].upper()}"
+                    logger.info(f"Unregistered patient — assigned temp ID: {raw_user_id}")
+
             request_id = f"BWR-{int(time.time())}"
-            now = datetime.now(timezone.utc).isoformat()
+            now        = datetime.now(timezone.utc).isoformat()
+
             request_data = {
                 "request_id":          request_id,
                 "blood_group":         blood_group,
-                "hospital_name":       hospital_name,
-                "city":                city or "",
+                "hospital_name":       location_name,
+                "city":                location_name,
                 "urgency":             urgency,
                 "status":              "SEARCHING",
                 "status_history":      [{"status": "SEARCHING", "timestamp": now}],
@@ -291,26 +360,35 @@ def handle_chat(event: dict) -> dict:
                 "created_at":          now,
                 "updated_at":          now,
                 "outreach_message":    "",
+                "patient_user_id":     raw_user_id,
             }
-            db_helpers.create_request(request_data)
-
-            ref_lat = float(known_profile.get("latitude") or 0) or None if known_profile else None
-            ref_lon = float(known_profile.get("longitude") or 0) or None if known_profile else None
-            all_eligible = db_helpers.get_eligible_donors(city=city) or db_helpers.get_eligible_donors()
-            ranked = matching.prioritise_donors(
-                all_eligible, blood_group,
-                declined_donor_ids=[],
-                ref_lat=ref_lat, ref_lon=ref_lon,
-            )
-            top10_ids = [d["donor_id"] for d in ranked[:10] if d.get("donor_id")]
-            db_helpers.update_request(request_id, {"ranked_donor_ids": top10_ids})
-            request_data["ranked_donor_ids"]   = top10_ids
-            request_data["declined_donor_ids"] = []
             if ref_lat:
                 request_data["latitude"]  = str(ref_lat)
                 request_data["longitude"] = str(ref_lon)
 
+            db_helpers.create_request(request_data)
+            logger.info(f"Request created: {request_id} for blood_group={blood_group} urgency={urgency}")
+
+            # Rank donors and trigger WhatsApp/SMS outreach
+            all_eligible = db_helpers.get_eligible_donors()
+            try:
+                ranked = matching.prioritise_donors(
+                    all_eligible, blood_group,
+                    declined_donor_ids=[],
+                    ref_lat=ref_lat, ref_lon=ref_lon,
+                )
+            except Exception:
+                ranked = matching.rank_donors(all_eligible, blood_group, exact_only=False)
+
+            top10_ids = [d["donor_id"] for d in ranked[:10] if d.get("donor_id")]
+            db_helpers.update_request(request_id, {"ranked_donor_ids": top10_ids})
+            request_data["ranked_donor_ids"]   = top10_ids
+            request_data["declined_donor_ids"] = []
+
+            # Run escalation — sends WhatsApp/SMS to top donors
             escalation_module.run_escalation(request_data, all_eligible)
+            logger.info(f"Escalation triggered for request {request_id}")
+
         except Exception as exc:
             logger.error(f"Failed to create/escalate request: {exc}", exc_info=True)
             request_id = None
@@ -319,7 +397,6 @@ def handle_chat(event: dict) -> dict:
         "response_text": response_text,
         "extracted_data": extracted,
         "request_id":     request_id,
-        "bridge_context": bridge_context,
     })
 
 
@@ -484,9 +561,21 @@ def handle_confirm(event: dict) -> dict:
                 "confirmed":   True,
             })
         else:
-            req     = db_helpers.get_request(request_id) or {}
+            req      = db_helpers.get_request(request_id) or {}
             declined = list(set(req.get("declined_donor_ids", []) + [donor_id]))
             db_helpers.update_request(request_id, {"declined_donor_ids": declined})
+
+            # Check if all contacted donors have now declined — if so escalate immediately
+            contacted = set(req.get("contacted_donor_ids", []))
+            if contacted and set(declined) >= contacted:
+                logger.info(f"All contacted donors declined for {request_id} — triggering escalation")
+                try:
+                    updated_req = {**req, "declined_donor_ids": declined}
+                    all_eligible = db_helpers.get_eligible_donors()
+                    escalation_module.run_escalation(updated_req, all_eligible)
+                except Exception as esc_exc:
+                    logger.error(f"Auto-escalation after decline failed: {esc_exc}", exc_info=True)
+
             return response(200, {
                 "message":    "Thank you for letting us know. We will contact another donor.",
                 "confirmed":  False,

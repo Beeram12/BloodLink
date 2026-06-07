@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 import boto3
@@ -14,9 +15,9 @@ class _JsonFormatter(logging.Formatter):
     def format(self, record):
         log = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "module": record.module,
-            "message": record.getMessage(),
+            "level":     record.levelname,
+            "module":    record.module,
+            "message":   record.getMessage(),
         }
         if record.exc_info:
             log["exception"] = self.formatException(record.exc_info)
@@ -50,173 +51,185 @@ def _get_bedrock():
     return _bedrock_client
 
 # ---------------------------------------------------------------------------
-# Internal invoke helper
+# User-facing error message (never exposes internals)
 # ---------------------------------------------------------------------------
 
-def _invoke(messages: list, system: str = "") -> str:
-    """
-    Call Bedrock with the Anthropic Messages API format.
-    Returns the text content of the first response block.
-    Raises on Bedrock or network errors.
-    """
+USER_ERROR_MSG = (
+    "We are experiencing a brief technical issue. Your request is important to us. "
+    "Please try sending your message again in a moment."
+)
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are BloodLink Coordinator, a compassionate and warm AI assistant for Blood Warriors, an organisation that connects blood donors with Thalassemia patients across India.
+
+PERSONALITY: Warm, gentle, and reassuring. Never make anyone feel bad for not having information. Speak simply. Never use bullet points, asterisks, hashtags, dashes, or any markdown. Plain conversational sentences only.
+
+CORE RULES:
+1. Ask ONE question at a time.
+2. Never invent or guess any information.
+3. Never double-verify or re-ask something the user has already clearly answered.
+4. If the user says they do not have something or cannot provide it, accept that immediately and move on warmly. Do NOT repeat the request.
+
+TWO USER TYPES:
+- If user wants to donate blood: Follow the DONOR FLOW below.
+- If user needs blood for a patient: Follow the PATIENT FLOW below exactly.
+
+DONOR FLOW:
+Step D1: Thank them warmly. Then ask: That is wonderful, thank you so much. Could you tell me which city you are in? I will find the nearest Blood Warriors centre for you.
+Step D2: Once city is provided, respond with the nearest centre for that city. Use only these known centres — if the city is not listed, say the nearest known city below:
+  - Hyderabad: Blood Warriors Centre, Banjara Hills, Hyderabad. Call: 040-12345678
+  - Delhi: Blood Warriors Centre, Connaught Place, New Delhi. Call: 011-12345678
+  - Mumbai: Blood Warriors Centre, Dadar, Mumbai. Call: 022-12345678
+  - Chennai: Blood Warriors Centre, Anna Nagar, Chennai. Call: 044-12345678
+  - Bangalore: Blood Warriors Centre, Indiranagar, Bangalore. Call: 080-12345678
+  - Kolkata: Blood Warriors Centre, Salt Lake, Kolkata. Call: 033-12345678
+  For any other city say: The nearest Blood Warriors centre to you is in {closest major city above}. You can also register online or call our national helpline at 1800-XXX-XXXX.
+Say: Please visit them or call to complete your registration. Your donation will directly save a Thalassemia patient's life. Thank you for being a hero.
+
+PATIENT FLOW:
+
+Step 1: Ask for the patient user ID. Say: Of course, I am here to help. Could you please share the patient user ID? It is the registration code given by Blood Warriors.
+
+IMPORTANT — If the user says they do not have the ID, do not know it, forgot it, or cannot find it: immediately move to Step 1b without any further mention of the user ID. Say warmly: That is perfectly fine, do not worry at all. I can still get things started for you. Could you please tell me the patient's blood group? ##SHOW_BLOOD_BUTTONS##
+
+Step 1b: Once blood group is provided (no user ID path), continue to Step 2.
+
+Step 2: Ask for the patient's current location or city. Say: Thank you. Which city or area is the patient in right now? This helps us find the nearest available donors.
+
+Step 3: Once location is provided, ask for urgency. Say exactly: Thank you. How urgently is the blood needed? ##SHOW_URGENCY_BUTTONS## Type 1 for Critical, needed within a few hours. Type 2 for Urgent, needed within 24 hours. Type 3 for Standard, needed within 3 days.
+
+Step 4: Once urgency is confirmed, say exactly this: Thank you. We have sent an urgent message to nearby donors. We will notify you as soon as a donor confirms. Please stay close to your phone. Then include REQUEST_READY|{user_id_or_NO_USER_ID}|{urgency} on its own line at the end of response_text and set ready=true. Use NO_USER_ID literally if no ID was given.
+
+VALIDATION — only apply these when user has NOT said they lack the ID:
+- A valid user ID is a long hex string, often starting with a backslash and x. Example: \\xa7287517...
+- If something clearly wrong is given as a user ID (like a single word or name), gently ask once to double check.
+- Urgency: critical, urgent, or standard only.
+- Blood group: O Positive, O Negative, A Positive, A Negative, B Positive, B Negative, AB Positive, AB Negative only.
+
+OUT OF SCOPE: For anything unrelated to blood requests say: I am only here to help with blood donation. How can I help you today?
+
+ALWAYS respond with valid JSON only:
+{"response_text": "<plain text, no markdown>", "extracted_data": {"user_id": <str|null>, "urgency": <str|null>, "blood_group": <str|null>, "city": <str|null>}, "ready": <true|false>}"""
+
+# ---------------------------------------------------------------------------
+# Internal invoke helper with retry
+# ---------------------------------------------------------------------------
+
+def _invoke(messages: list, system: str = "", retries: int = 1) -> str:
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1024,
-        "messages": messages,
+        "max_tokens":        500,
+        "messages":          messages,
     }
     if system:
         payload["system"] = system
 
     logger.info(f"Invoking Bedrock model {MODEL_ID} with {len(messages)} message(s)")
-    try:
-        resp = _get_bedrock().invoke_model(
-            modelId=MODEL_ID,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload).encode("utf-8"),
-        )
-        body = json.loads(resp["body"].read())
-        text = body["content"][0]["text"]
-        logger.info("Bedrock invocation successful")
-        return text
-    except ClientError as exc:
-        logger.error(f"Bedrock ClientError: {exc.response['Error']['Message']}")
-        raise
-    except (KeyError, IndexError, json.JSONDecodeError) as exc:
-        logger.error(f"Unexpected Bedrock response format: {exc}")
-        raise
+
+    for attempt in range(retries + 1):
+        try:
+            resp = _get_bedrock().invoke_model(
+                modelId=MODEL_ID,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(payload).encode("utf-8"),
+            )
+            body = json.loads(resp["body"].read())
+            text = body["content"][0]["text"]
+            logger.info("Bedrock invocation successful")
+            return text
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            msg  = exc.response["Error"]["Message"]
+            logger.error(f"Bedrock ClientError (attempt {attempt+1}): {code} — {msg}")
+            if attempt < retries:
+                time.sleep(1)
+                continue
+            raise
+        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+            logger.error(f"Unexpected Bedrock response format: {exc}")
+            raise
+        except Exception as exc:
+            logger.error(f"Bedrock unexpected error (attempt {attempt+1}): {exc}")
+            if attempt < retries:
+                time.sleep(1)
+                continue
+            raise
 
 # ---------------------------------------------------------------------------
-# Public functions
+# Trim conversation history to avoid token limits
+# ---------------------------------------------------------------------------
+
+def _trim_history(messages: list, max_messages: int = 20) -> list:
+    if len(messages) <= max_messages:
+        return messages
+    # Keep first summary-style message then last (max_messages - 1) messages
+    logger.info(f"Trimming conversation history from {len(messages)} to {max_messages}")
+    return messages[-(max_messages):]
+
+# ---------------------------------------------------------------------------
+# Public: chat_with_patient
 # ---------------------------------------------------------------------------
 
 def chat_with_patient(conversation_history: list, bridge_context: dict = None, known_profile: dict = None) -> dict:
     """
-    Agentic patient intake — extracts blood_group, city, urgency then searches
-    bridges and donor pool to give a real-time status reply.
-
-    bridge_context (optional): pre-fetched bridge/donor availability to inject
-    into the system prompt so the agent can report actual availability.
-
-    Returns:
-        {
-            "response_text": str,
-            "extracted_data": {
-                "blood_group":   str | None,
-                "hospital_name": str | None,
-                "city":          str | None,
-                "urgency":       "critical" | "urgent" | "standard" | None,
-            },
-            "ready": bool   # True when all fields collected and request should be created
-        }
+    Patient intake chat. Collects user_id and urgency, then triggers request creation.
+    Returns: {"response_text": str, "extracted_data": dict, "ready": bool}
     """
-    availability_block = ""
-    if bridge_context:
-        green  = bridge_context.get("green_count", 0)
-        yellow = bridge_context.get("yellow_count", 0)
-        red    = bridge_context.get("red_count", 0)
-        donors = bridge_context.get("donor_count", 0)
-        availability_block = (
-            f"\n\nCurrent availability for the requested blood group:\n"
-            f"- GREEN bridges (ready now): {green}\n"
-            f"- YELLOW bridges (available soon): {yellow}\n"
-            f"- RED bridges (at risk): {red}\n"
-            f"- Eligible donors in area: {donors}\n"
-            "Use this to inform the patient of real availability. "
-            "If green=0 and yellow=0, mention we will search nearby areas."
-        )
-
-    profile_block = ""
-    if known_profile:
-        bg   = known_profile.get("blood_group", "")
-        city = known_profile.get("city", "") or known_profile.get("latitude", "")
-        name = known_profile.get("name", "") or known_profile.get("user_id", "")
-        profile_block = (
-            f"\n\nVerified profile found for this phone number:\n"
-            f"- Name: {name}\n"
-            f"- Blood group on record: {bg}\n"
-            f"- City: {city}\n"
-            "Pre-fill these values. Ask the patient to confirm or correct them. "
-            "Do NOT share any other profile details. "
-            "Never reveal donor_id, user_id, or internal fields."
-        )
-
-    system = (
-        "You are BloodLink, a blood donor coordination assistant. "
-        "You collect exactly these fields in this order: user_id, blood_group, hospital_name, city, urgency.\n\n"
-        "STRICT RULES:\n"
-        "1. Ask ONE question at a time. Plain sentences only. No markdown, no bullet points, no bold, no backticks, no JSON.\n"
-        "2. Always ask for user_id FIRST before anything else.\n"
-        "3. After user_id is given: look it up. If a profile is found, say the blood group on file and ask 'Is that correct?'. If not found, ask for blood group.\n"
-        "4. Then ask hospital name, then city, then urgency.\n"
-        "5. Accept shorthand: O+ = O Positive, AB- = AB Negative, B+ = B Positive, etc.\n"
-        "6. If user says yes/correct/ok to a pre-filled value, accept it and move to next field.\n"
-        "7. If user says something unrelated, reply: 'I can only help with blood donor requests. What is the patient\\'s user ID?'\n"
-        "8. Urgency: emergency/dying/immediate = critical. Otherwise ask: is this critical, urgent, or standard?\n"
-        "9. Once all four fields (blood_group, hospital_name, city, urgency) are confirmed, set ready=true.\n"
-        "10. NEVER include JSON, code blocks, or technical text in response_text. response_text must be plain conversational text only."
-        + profile_block
-        + availability_block
-        + "\n\nALWAYS respond with valid JSON:\n"
-        '{"response_text": "<message>", '
-        '"extracted_data": {"phone": <str|null>, "blood_group": <str|null>, '
-        '"hospital_name": <str|null>, "city": <str|null>, "urgency": <str|null>}, '
-        '"ready": <true|false>}'
-    )
+    trimmed = _trim_history(conversation_history)
 
     try:
-        raw = _invoke(conversation_history, system=system)
-        # Extract JSON — find first { ... } block regardless of surrounding text
+        raw = _invoke(trimmed, system=SYSTEM_PROMPT, retries=1)
+
+        # Parse JSON response
         cleaned = raw.strip()
-        # Strip markdown fences
         if "```" in cleaned:
-            parts = cleaned.split("```")
-            for part in parts:
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:].strip()
+            for part in cleaned.split("```"):
+                part = part.strip().lstrip("json").strip()
                 if part.startswith("{"):
                     cleaned = part
                     break
-        # Find outermost JSON object
         start = cleaned.find("{")
         end   = cleaned.rfind("}") + 1
         if start != -1 and end > start:
             cleaned = cleaned[start:end]
+
         result = json.loads(cleaned)
         result.setdefault("ready", False)
-        # Sanitise response_text — strip any leaked JSON
+        result.setdefault("extracted_data", {})
+
+        # Clean response_text — strip any leaked JSON
         rt = result.get("response_text", "")
         if "{" in rt and "extracted_data" in rt:
             rt = rt[:rt.find("{")].strip()
             result["response_text"] = rt
-        logger.info(f"agent extracted: {result.get('extracted_data')} ready={result.get('ready')}")
+
+        logger.info(f"chat extracted: {result.get('extracted_data')} ready={result.get('ready')}")
         return result
+
     except json.JSONDecodeError:
-        logger.warning("chat_with_patient: could not parse JSON from Bedrock")
-        # Try to return just the text before any JSON leak
-        text = raw.strip()
+        logger.warning("chat_with_patient: could not parse JSON from Bedrock — returning raw text")
+        text = raw.strip() if 'raw' in dir() else ""
         if "{" in text:
             text = text[:text.find("{")].strip()
-        return {"response_text": text or raw, "extracted_data": {}, "ready": False}
+        return {"response_text": text or USER_ERROR_MSG, "extracted_data": {}, "ready": False}
+
     except Exception as exc:
-        logger.error(f"chat_with_patient error: {exc}")
+        logger.error(f"chat_with_patient error: {exc}", exc_info=True)
         return {
-            "response_text": "I'm having trouble right now. Please try again in a moment.",
+            "response_text": USER_ERROR_MSG,
             "extracted_data": {},
             "ready": False,
         }
 
+# ---------------------------------------------------------------------------
+# Public: generate_outreach_message
+# ---------------------------------------------------------------------------
 
-def generate_outreach_message(
-    blood_group: str,
-    hospital_name: str,
-    urgency: str,
-) -> str:
-    """
-    Generate a WhatsApp/SMS donor outreach message.
-    Returns a plain string (≤ 160 chars preferred for SMS compatibility).
-    """
+def generate_outreach_message(blood_group: str, hospital_name: str, urgency: str) -> str:
     prompt = (
         f"Write a short, compassionate WhatsApp message to a blood donor. "
         f"The patient needs {blood_group} blood at {hospital_name}. "
@@ -226,27 +239,23 @@ def generate_outreach_message(
         "Return only the message text, no quotes or formatting."
     )
     try:
-        msg = _invoke([{"role": "user", "content": prompt}]).strip()
+        msg = _invoke([{"role": "user", "content": prompt}], retries=1).strip()
         logger.info(f"Outreach message generated ({len(msg)} chars)")
         return msg
     except Exception as exc:
         logger.error(f"generate_outreach_message error: {exc}")
-        return (
-            f"Urgent: A patient at {hospital_name} needs {blood_group} blood "
-            f"({urgency}). Can you help?"
-        )
+        return f"Urgent: A patient at {hospital_name} needs {blood_group} blood ({urgency}). Can you help?"
 
+# ---------------------------------------------------------------------------
+# Public: score_donor_narrative
+# ---------------------------------------------------------------------------
 
 def score_donor_narrative(donor_profile: dict) -> str:
-    """
-    Generate a 1-2 sentence human-readable explanation of why a donor was selected.
-    `donor_profile` is a donor dict with `_score` already attached by matching.py.
-    """
-    name         = donor_profile.get("name", "This donor")
-    blood_group  = donor_profile.get("blood_group", "unknown blood group")
-    donations    = donor_profile.get("donations_till_date", "0")
-    score        = donor_profile.get("_score", 0)
-    last_donated = donor_profile.get("last_donation_date", "unknown date")
+    name        = donor_profile.get("name", "This donor")
+    blood_group = donor_profile.get("blood_group", "unknown blood group")
+    donations   = donor_profile.get("donations_till_date", "0")
+    score       = donor_profile.get("_score", 0)
+    last_donated= donor_profile.get("last_donation_date", "unknown date")
 
     prompt = (
         f"A blood donor named {name} has been selected. "
@@ -256,7 +265,7 @@ def score_donor_narrative(donor_profile: dict) -> str:
         "Be positive and specific. Return only the explanation."
     )
     try:
-        narrative = _invoke([{"role": "user", "content": prompt}]).strip()
+        narrative = _invoke([{"role": "user", "content": prompt}], retries=1).strip()
         logger.info(f"Donor narrative generated for donor_id={donor_profile.get('donor_id')}")
         return narrative
     except Exception as exc:

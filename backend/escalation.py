@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from db_helpers import update_request, get_request
 from matching import prioritise_donors
 from bedrock_helpers import generate_outreach_message
-from twilio_helpers import send_donor_outreach, send_sms
+from twilio_helpers import send_donor_outreach, send_email
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -217,9 +217,9 @@ def _level_2(request: dict, all_eligible_donors: list) -> dict:
         donor = donor_map.get(did)
         if not donor:
             continue
-        phone = donor.get("phone_number") or donor.get("phone") or donor.get("mobile") or ""
-        if phone:
-            send_sms(phone, f"[REMINDER] {message}")
+        email = donor.get("email") or donor.get("email_address") or ""
+        if email:
+            send_email(email, "Reminder: Blood donation needed", f"[REMINDER] {message}")
 
     all_contacted = list(contacted | set(newly))
     _persist(request_id, all_contacted, 2)
@@ -261,10 +261,11 @@ def _level_4(request: dict, all_eligible_donors: list) -> dict:
         f"Hospital: {request.get('hospital_name')}, "
         f"Urgency: {request.get('urgency')}. Automated outreach exhausted."
     )
-    if COORDINATOR_PHONE:
-        send_sms(COORDINATOR_PHONE, alert)
+    coordinator_email = os.environ.get("COORDINATOR_EMAIL", "")
+    if coordinator_email:
+        send_email(coordinator_email, "[BloodLink ALERT] Request needs intervention", alert)
     else:
-        logger.warning("COORDINATOR_PHONE not set — coordinator alert skipped")
+        logger.warning("COORDINATOR_EMAIL not set — coordinator alert skipped")
 
     contacted = list(_already_contacted(request))
     _persist(request_id, contacted, 5, status="NEEDS_HUMAN")
